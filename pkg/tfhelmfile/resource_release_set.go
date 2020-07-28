@@ -1,13 +1,15 @@
 package tfhelmfile
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
-	"reflect"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -26,6 +28,7 @@ const KeyEnvironment = "environment"
 const KeyBin = "binary"
 const KeyHelmBin = "helm_binary"
 const KeyDiffOutput = "diff_output"
+const KeyError = "error"
 const KeyApplyOutput = "apply_output"
 const KeyDirty = "dirty"
 const KeyConcurrency = "concurrency"
@@ -34,10 +37,11 @@ const HelmfileDefaultPath = "helmfile.yaml"
 
 func resourceShellHelmfileReleaseSet() *schema.Resource {
 	return &schema.Resource{
-		Create: resourceReleaseSetCreate,
-		Delete: resourceReleaseSetDelete,
-		Read:   resourceReleaseSetRead,
-		Update: resourceReleaseSetUpdate,
+		Create:        resourceReleaseSetCreate,
+		Delete:        resourceReleaseSetDelete,
+		Read:          resourceReleaseSetRead,
+		Update:        resourceReleaseSetUpdate,
+		CustomizeDiff: resourceReleaseSetDiff,
 		Schema: map[string]*schema.Schema{
 			KeyValuesFiles: {
 				Type:     schema.TypeList,
@@ -69,13 +73,13 @@ func resourceShellHelmfileReleaseSet() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: false,
-				Default:  ".",
+				Default:  "",
 			},
 			KeyPath: {
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: false,
-				Default:  HelmfileDefaultPath,
+				Default:  "",
 			},
 			KeyContent: {
 				Type:     schema.TypeString,
@@ -102,11 +106,13 @@ func resourceShellHelmfileReleaseSet() *schema.Resource {
 			},
 			KeyDiffOutput: {
 				Type:     schema.TypeString,
-				Optional: true,
-				// So that we can set this in `read` to instruct `terraform plan` to show diff as being disappear on `terraform apply`
-				Computed: false,
+				Computed: true,
 			},
 			KeyApplyOutput: {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+			KeyError: {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -131,6 +137,10 @@ func resourceReleaseSetCreate(d *schema.ResourceData, meta interface{}) error {
 
 func resourceReleaseSetRead(d *schema.ResourceData, meta interface{}) error {
 	return read(d, meta, []string{"read"})
+}
+
+func resourceReleaseSetDiff(d *schema.ResourceDiff, meta interface{}) error {
+	return diff(d, meta)
 }
 
 func resourceReleaseSetUpdate(d *schema.ResourceData, meta interface{}) error {
@@ -158,52 +168,108 @@ type ReleaseSet struct {
 	Concurrency          int
 }
 
-func MustRead(d *schema.ResourceData) *ReleaseSet {
+type ResourceFields interface {
+	Id() string
+	Get(string) interface{}
+}
+
+func MustRead(d ResourceFields) (*ReleaseSet, error) {
 	f := ReleaseSet{}
-	f.Environment = d.Get(KeyEnvironment).(string)
-	f.Path = d.Get(KeyPath).(string)
-	f.Content = d.Get(KeyContent).(string)
+
+	// environment defaults to "helm" for helmfile_release_set but it's always nil for helmfile_release.
+	// This nil-check is required to handle the latter case. Otherwise it ends up with:
+	//   panic: interface conversion: interface {} is nil, not string
+	if env := d.Get(KeyEnvironment); env != nil {
+		f.Environment = env.(string)
+	}
+	// environment defaults to "" for helmfile_release_set but it's always nil for helmfile_release.
+	// This nil-check is required to handle the latter case. Otherwise it ends up with:
+	//   panic: interface conversion: interface {} is nil, not string
+	if path := d.Get(KeyPath); path != nil {
+		f.Path = path.(string)
+	}
+
+	if content := d.Get(KeyContent); content != nil {
+		f.Content = content.(string)
+	}
+
 	f.DiffOutput = d.Get(KeyDiffOutput).(string)
 	f.ApplyOutput = d.Get(KeyApplyOutput).(string)
 	f.HelmBin = d.Get(KeyHelmBin).(string)
-	f.Selector = d.Get(KeySelector).(map[string]interface{})
-	f.ValuesFiles = d.Get(KeyValuesFiles).([]interface{})
+
+	if selector := d.Get(KeySelector); selector != nil {
+		f.Selector = selector.(map[string]interface{})
+	}
+
+	if valuesFiles := d.Get(KeyValuesFiles); valuesFiles != nil {
+		f.ValuesFiles = valuesFiles.([]interface{})
+	}
+
 	f.Values = d.Get(KeyValues).([]interface{})
 	f.Bin = d.Get(KeyBin).(string)
 	f.WorkingDirectory = d.Get(KeyWorkingDirectory).(string)
-	f.EnvironmentVariables = d.Get(KeyEnvironmentVariables).(map[string]interface{})
-	f.Concurrency = d.Get(KeyConcurrency).(int)
-	return &f
-}
 
-func SetDiffOutput(d *schema.ResourceData, v string) {
-	d.Set(KeyDiffOutput, v)
+	log.Printf("Printing raw working directory for %q: %s", d.Id(), f.WorkingDirectory)
+
+	if f.Path != "" {
+		if info, err := os.Stat(f.Path); err != nil {
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("verifying working_directory %q: %w", f.Path, err)
+			}
+		} else if info != nil && info.IsDir() {
+			f.WorkingDirectory = f.Path
+		} else {
+			f.WorkingDirectory = filepath.Dir(f.Path)
+		}
+	}
+
+	log.Printf("Printing computed working directory for %q: %s", d.Id(), f.WorkingDirectory)
+
+	if environmentVariables := d.Get(KeyEnvironmentVariables); environmentVariables != nil {
+		f.EnvironmentVariables = environmentVariables.(map[string]interface{})
+	}
+
+	if concurrency := d.Get(KeyConcurrency); concurrency != nil {
+		f.Concurrency = concurrency.(int)
+	}
+	return &f, nil
 }
 
 func SetApplyOutput(d *schema.ResourceData, v string) {
 	d.Set(KeyApplyOutput, v)
 }
 
-func GenerateCommand(fs *ReleaseSet, additionals ...string) (*exec.Cmd, error) {
+func GenerateCommand(fs *ReleaseSet, additionalArgs ...string) (*exec.Cmd, error) {
 	if fs.Content != "" && fs.Path != "" && fs.Path != HelmfileDefaultPath {
 		return nil, fmt.Errorf("content and path can't be specified together: content=%q, path=%q", fs.Content, fs.Path)
 	}
+
+	if fs.WorkingDirectory != "" {
+		if err := os.MkdirAll(fs.WorkingDirectory, 0755); err != nil {
+			return nil, fmt.Errorf("creating working directory %q: %w", fs.WorkingDirectory, err)
+		}
+	}
+
 	var path string
 	if fs.Content != "" {
 		bs := []byte(fs.Content)
 		first := sha256.New()
 		first.Write(bs)
 		path = fmt.Sprintf("helmfile-%x.yaml", first.Sum(nil))
-		if err := ioutil.WriteFile(path, bs, 0700); err != nil {
+		if err := ioutil.WriteFile(filepath.Join(fs.WorkingDirectory, path), bs, 0700); err != nil {
 			return nil, err
 		}
 	} else {
 		path = fs.Path
 	}
+
+	log.Printf("Taking diff with %+v", *fs)
+
 	args := []string{
 		"--environment", fs.Environment,
 		"--file", path,
 		"--helm-binary", fs.HelmBin,
+		"--no-color",
 	}
 	for k, v := range fs.Selector {
 		args = append(args, "--selector", fmt.Sprintf("%s=%s", k, v))
@@ -216,20 +282,23 @@ func GenerateCommand(fs *ReleaseSet, additionals ...string) (*exec.Cmd, error) {
 		first := sha256.New()
 		first.Write(js)
 		tmpf := fmt.Sprintf("temp.values-%x.yaml", first.Sum(nil))
-		if err := ioutil.WriteFile(tmpf, js, 0700); err != nil {
+		if err := ioutil.WriteFile(filepath.Join(fs.WorkingDirectory, tmpf), js, 0700); err != nil {
 			return nil, err
 		}
 		args = append(args, "--state-values-file", tmpf)
 	}
-	cmd := exec.Command(fs.Bin, append(args, additionals...)...)
+	cmd := exec.Command(fs.Bin, append(args, additionalArgs...)...)
 	cmd.Dir = fs.WorkingDirectory
 	cmd.Env = append(os.Environ(), readEnvironmentVariables(fs.EnvironmentVariables)...)
-	log.Printf("[DEBUG] Cmd: %s", strings.Join(cmd.Args, " "))
+	log.Printf("[DEBUG] Generated command: wd = %s, args = %s", fs.WorkingDirectory, strings.Join(cmd.Args, " "))
 	return cmd, nil
 }
 
 func create(d *schema.ResourceData, meta interface{}, stack []string) error {
-	fs := MustRead(d)
+	fs, err := MustRead(d)
+	if err != nil {
+		return err
+	}
 	return createRs(fs, d, meta, stack)
 }
 
@@ -249,92 +318,194 @@ func createRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []
 	}
 	d.MarkNewResource()
 	//obtain exclusive lock
-	helmfileMutexKV.Lock(releaseSetMutexKey)
+	mutexKV.Lock(fs.WorkingDirectory)
+	defer mutexKV.Unlock(fs.WorkingDirectory)
 
 	state := NewState()
 	st, err := runCommand(cmd, state, false)
 	if err != nil {
 		return err
 	}
-	helmfileMutexKV.Unlock(releaseSetMutexKey)
-
-	//// Assume we won't have any diff after successful apply
-	//SetDiffOutput(d, "")
 
 	//create random uuid for the id
 	id := xid.New().String()
 	d.SetId(id)
 
 	SetApplyOutput(d, st.Output)
-	SetDiffOutput(d, "")
+	//SetDiffOutput(d, "")
 
 	return nil
 }
 
 func read(d *schema.ResourceData, meta interface{}, stack []string) error {
-	fs := MustRead(d)
+	fs, err := MustRead(d)
+	if err != nil {
+		return err
+	}
 	return readRs(fs, d, meta, stack)
+}
+
+func diff(d *schema.ResourceDiff, meta interface{}) error {
+	old, new := d.GetChange(KeyWorkingDirectory)
+	log.Printf("Getting old and new working directories for id %q: old = %v, new = %v, got = %v", d.Id(), old, new, d.Get(KeyWorkingDirectory))
+
+	fs, err := MustRead(d)
+	if err != nil {
+		return err
+	}
+
+	return diffRs(fs, d, meta)
 }
 
 func readRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []string) error {
 	log.Printf("[DEBUG] Reading release set resource...")
-	printStackTrace(stack)
 
+	// We run `helmfile build` against the state BEFORE the planned change,
+	// to make sure any error in helmfile.yaml before successful apply is shown to the user.
+	_, err := runBuild(fs)
+	if err != nil {
+		log.Printf("[DEBUG] Build error detected: %v", err)
+
+		d.Set(KeyError, err.Error())
+
+		return nil
+	}
+
+	//d.Set(KeyDiffOutput, state.Output)
+
+	return nil
+}
+
+func runBuild(fs *ReleaseSet) (*State, error) {
+	args := []string{
+		"build",
+	}
+
+	cmd, err := GenerateCommand(fs, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	//obtain exclusive lock
+	mutexKV.Lock(fs.WorkingDirectory)
+	defer mutexKV.Unlock(fs.WorkingDirectory)
+
+	state := NewState()
+	return runCommand(cmd, state, true)
+}
+
+func runDiff(fs *ReleaseSet) (*State, error) {
 	args := []string{
 		"diff",
 		"--concurrency", strconv.Itoa(fs.Concurrency),
 		"--detailed-exitcode",
 		"--suppress-secrets",
+		"--context", "5",
 	}
 
 	cmd, err := GenerateCommand(fs, args...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	//obtain exclusive lock
-	helmfileMutexKV.Lock(releaseSetMutexKey)
+	mutexKV.Lock(fs.WorkingDirectory)
+	defer mutexKV.Unlock(fs.WorkingDirectory)
 
 	state := NewState()
-	newState, err := runCommand(cmd, state, true)
+	return runCommand(cmd, state, true)
+}
+
+// diffRs detects diff to be included in the terraform plan by runnning `helmfile diff`.
+// Beware that this function MUST be idempotent and the result is reliable.
+//
+// `terraform apply` seem to run diff twice, and if this function emitted a result different than the first run results in
+// errors like:
+//
+//   When expanding the plan for helmfile_release_set.mystack to include new values
+//   learned so far during apply, provider "registry.terraform.io/-/helmfile"
+//   produced an invalid new value for .diff_output: was cty.StringVal("Adding repo
+//   ...
+//   a lot of text
+//   ...
+//   but now cty.StringVal("Adding repo stable
+//   ...
+//   a lot of text
+//   ...
+func diffRs(fs *ReleaseSet, d *schema.ResourceDiff, meta interface{}) error {
+	log.Printf("[DEBUG] Detecting changes on release set resource...")
+
+	if fs.Path != "" {
+		_, err := os.Stat(fs.Path)
+		if err != nil {
+			return fmt.Errorf("verifying path %q: %w", fs.Path, err)
+		}
+	}
+
+	state, err := runDiff(fs)
 	if err != nil {
+		log.Printf("[DEBUG] Diff error detected: %v", err)
+
+		// Make sure errors due to the latest `helmfile diff` run is shown to the user
+		// d.SetNew(KeyError, err.Error())
+
+		// We return the error to stop terraform from modifying the state AND
+		// let the user knows about the error.
 		return err
 	}
-	output := newState.Output
 
-	helmfileMutexKV.Unlock(releaseSetMutexKey)
-	if newState == nil {
-		log.Printf("[DEBUG] State from read operation was nil. Marking resource for deletion.")
-		d.SetId("")
-		return nil
-	}
-	log.Printf("[DEBUG] output:|%v|", output)
-	log.Printf("[DEBUG] new output:|%v|", newState.Output)
+	// We should ideally show this like `~ diff_output = <DIFF> -> (known after apply)`,
+	// but it's shown as `~ diff_output = <DIFF>`, which is counter-intuitive.
+	// But I wasn't able to find any way to achieve that.
+	//d.SetNew(KeyDiffOutput, state.Output)
+	//d.SetNewComputed(KeyDiffOutput)
 
-	SetDiffOutput(d, output)
-	SetApplyOutput(d, "")
+	// Show the possibly transient error to disappear after successful apply.
+	//
+	// Seems like SetNew(KEY, "") is equivalent to SetNewComputed(KEY), according to the result below that is obtained
+	// with SetNew:
+	//         ~ error                 = "/Users/c-ykuoka/go/bin/helmfile: exit status 1\nin ./helmfile-b96f019fb6b4f691ffca8269edb33ffb16cb60a20c769013049c1181ebf7ecc9.yaml: failed to read helmfile-b96f019fb6b4f691ffca8269edb33ffb16cb60a20c769013049c1181ebf7ecc9.yaml: reading document at index 1: yaml: line 2: mapping values are not allowed in this context\n" -> (known after apply)
+	//d.SetNew(KeyError, "")
+	//d.SetNewComputed(KeyError)
 
-	isStateEqual := reflect.DeepEqual(fs.DiffOutput, newState.Output)
-	isNewResource := d.IsNewResource()
-	isUpdatedResource := stack[0] == "update"
-	if !isStateEqual && !isNewResource && !isUpdatedResource {
-		log.Printf("[DEBUG] Previous state not equal to new state. Marking resource as dirty to trigger update.")
-		d.Set(KeyDirty, true)
-		return nil
+	// Mark apply output for changes to instruct the user to run `terraform apply`
+	// Marking it when there's no diff output means `terraform plan` always show changes, which defeats the purpose of
+	// `plan`.
+	if state.Output != "" {
+		buf := &bytes.Buffer{}
+		w := bufio.NewWriter(buf)
+
+		b := bufio.NewScanner(strings.NewReader(state.Output))
+		for b.Scan() {
+			l := b.Text()
+			if !strings.HasPrefix(l, "...Successfully got an update from the \"") {
+				_, err := w.WriteString(l)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		d.SetNew(KeyDiffOutput, buf.String())
+		d.SetNewComputed(KeyError)
+		d.SetNewComputed(KeyApplyOutput)
 	}
 
 	return nil
 }
 
 func update(d *schema.ResourceData, meta interface{}, stack []string) error {
-	fs := MustRead(d)
+	fs, err := MustRead(d)
+	if err != nil {
+		return err
+	}
 	return updateRs(fs, d, meta, stack)
 }
 
 func updateRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []string) error {
 	log.Printf("[DEBUG] Updating release set resource...")
+
 	d.Set(KeyDirty, false)
-	printStackTrace(stack)
 
 	args := []string{
 		"apply",
@@ -348,30 +519,29 @@ func updateRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []
 	}
 
 	//obtain exclusive lock
-	helmfileMutexKV.Lock(releaseSetMutexKey)
+	mutexKV.Lock(fs.WorkingDirectory)
+	defer mutexKV.Unlock(fs.WorkingDirectory)
 
 	state := NewState()
 	st, err := runCommand(cmd, state, false)
 	if err != nil {
+		d.Set(KeyError, err.Error())
+		d.Set(KeyApplyOutput, "")
+
 		return err
 	}
 
-	SetApplyOutput(d, st.Output)
-
-	helmfileMutexKV.Unlock(releaseSetMutexKey)
-
-	//if err := read(d, meta, stack); err != nil {
-	//	return err
-	//}
-	//
-	SetDiffOutput(d, "")
+	d.Set(KeyError, "")
 	SetApplyOutput(d, st.Output)
 
 	return nil
 }
 
 func delete(d *schema.ResourceData, meta interface{}, stack []string) error {
-	fs := MustRead(d)
+	fs, err := MustRead(d)
+	if err != nil {
+		return err
+	}
 	return deleteRs(fs, d, meta, stack)
 }
 
@@ -384,8 +554,8 @@ func deleteRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []
 	}
 
 	//obtain exclusive lock
-	helmfileMutexKV.Lock(releaseSetMutexKey)
-	defer helmfileMutexKV.Unlock(releaseSetMutexKey)
+	mutexKV.Lock(fs.WorkingDirectory)
+	defer mutexKV.Unlock(fs.WorkingDirectory)
 
 	state := NewState()
 	_, err = runCommand(cmd, state, false)
@@ -393,7 +563,7 @@ func deleteRs(fs *ReleaseSet, d *schema.ResourceData, meta interface{}, stack []
 		return err
 	}
 
-	SetDiffOutput(d, "")
+	//SetDiffOutput(d, "")
 
 	d.SetId("")
 
